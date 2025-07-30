@@ -1,0 +1,88 @@
+# -------------------------
+# Python artifacts
+# -------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# -------------------------
+# Environment & secrets
+# -------------------------
+.env
+*.env
+.env.*
+.envrc
+*.pem
+*.key
+*.crt
+*.cer
+
+# -------------------------
+# Virtual environments
+# -------------------------
+.venv/
+venv/
+ENV/
+
+# -------------------------
+# Python tooling caches
+# -------------------------
+.mypy_cache/
+.pytest_cache/
+.tox/
+coverage.xml
+.coverage
+*.cover
+*.log
+*.sqlite3
+.cache/
+nosetests.xml
+
+# -------------------------
+# IDE & Editor folders
+# -------------------------
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# -------------------------
+# Docker
+# -------------------------
+*.pid
+*.pid.lock
+docker-compose.override.yml
+
+# -------------------------
+# AWS credentials/config (DO NOT COMMIT)
+# -------------------------
+.aws/
+.aws-credentials
+
+# -------------------------
+# System files
+# -------------------------
+.DS_Store
+Thumbs.db
+
+# -------------------------
+# Local data
+# -------------------------
+*.db
+*.tar
+*.tgz
+*.zip
+*.bak
+
+# -------------------------
+# Project-specific files
+# -------------------------
+tree_output.txt
+*.iml
+node_modules/

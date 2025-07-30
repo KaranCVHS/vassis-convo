@@ -1,0 +1,16 @@
+{
+  "name": "avr-infra",
+  "version": "1.2.0",
+  "author": "Giuseppe Careri <info@gcareri.com> (https://gcareri.com)",
+  "contributors": [],
+  "keywords": ["avr", "agentvoiceresponse", "voicebot", "infra"],
+  "scripts": {
+    "dc:up": "docker compose up -d",
+    "dc:down": "docker compose down",
+    "dc:pull": "docker compose pull"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/agentvoiceresponse/avr-infra.git"
+  }
+}

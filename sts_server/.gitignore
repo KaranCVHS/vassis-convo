@@ -1,0 +1,53 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+.venv/
+.env
+.python-version
+
+# Installer logs
+pip-log.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+
+# Pytest
+.pytest_cache/
+
+# MyPy
+.mypy_cache/
+
+# VS Code
+.vscode/
+
+# Pyre
+.pyre/
+
+# Pylint
+.pylint.d/
+
+# Environments and dependencies
+uv.lock
+*.lock
+
+# Local files
+*.log
+.DS_Store
+*.sqlite3
+*.db
+*.pem
+
+# Ignore the tree output file
+tree_output.txt

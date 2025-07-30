@@ -1,0 +1,9 @@
+boto3
+websockets
+torchaudio
+torch
+silero-vad
+python-dotenv
+sounddevice
+numpy
+amazon_transcribe

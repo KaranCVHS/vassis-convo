@@ -1,0 +1,80 @@
+services:
+  avr-core:
+    image: agentvoiceresponse/avr-core
+    platform: linux/x86_64
+    container_name: avr-core
+    restart: always
+    environment:
+      - PORT=5001
+      - STS_URL=http://avr-sts-aws:6030/speech-to-speech-stream
+    ports:
+      - 5001:5001
+    networks:
+      - avr
+
+  wss-server:
+    build: ./aws-service
+    platform: linux/x86_64
+    container_name: avr-sts-aws
+    restart: always
+    environment:
+      - PORT=6030
+    networks:
+      - avr
+
+  avr-sts-server:
+    build: ./sts_server
+    container_name: avr-sts-server
+    restart: always
+    environment:
+      - AWS_REGION=${AWS_REGION}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - BEDROCK_MODEL_ID=${BEDROCK_MODEL_ID}
+      - POLLY_VOICE_ID=${POLLY_VOICE_ID}
+
+    networks:
+      - avr
+
+ 
+  avr-asterisk:
+    image: agentvoiceresponse/avr-asterisk
+    container_name: avr-asterisk
+    restart: always
+    ports:
+      - 5038:5038
+      - 5060:5060
+      - 8088:8088
+      - 10000-10050:10000-10050/udp
+    volumes:
+      - ./asterisk/conf/manager.conf:/etc/asterisk/my_manager.conf
+      - ./asterisk/conf/pjsip.conf:/etc/asterisk/my_pjsip.conf
+      - ./asterisk/conf/extensions.conf:/etc/asterisk/my_extensions.conf
+      - ./asterisk/conf/queues.conf:/etc/asterisk/my_queues.conf
+      - ./asterisk/conf/ari.conf:/etc/asterisk/my_ari.conf
+    networks:
+      - avr
+ 
+  avr-ami:
+    image: agentvoiceresponse/avr-ami
+    platform: linux/x86_64
+    container_name: avr-ami
+    restart: always
+    environment:
+      - PORT=6006
+      - AMI_HOST=${AMI_HOST:-avr-asterisk}
+      - AMI_PORT=${AMI_PORT:-5038}
+      - AMI_USERNAME=${AMI_USERNAME:-avr}
+      - AMI_PASSWORD=${AMI_PASSWORD:-avr}
+    ports:
+      - 6006:6006
+    networks:
+      - avr
+ 
+networks:
+  avr:
+    name: avr
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
