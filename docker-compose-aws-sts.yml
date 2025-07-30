@@ -32,10 +32,10 @@ services:
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
       - BEDROCK_MODEL_ID=${BEDROCK_MODEL_ID}
       - POLLY_VOICE_ID=${POLLY_VOICE_ID}
-
+    ports:
+      - 8766:8766
     networks:
       - avr
-
  
   avr-asterisk:
     image: agentvoiceresponse/avr-asterisk
@@ -52,6 +52,8 @@ services:
       - ./asterisk/conf/extensions.conf:/etc/asterisk/my_extensions.conf
       - ./asterisk/conf/queues.conf:/etc/asterisk/my_queues.conf
       - ./asterisk/conf/ari.conf:/etc/asterisk/my_ari.conf
+    environment:
+      - EC2_PUBLIC_IP=${EC2_PUBLIC_IP}
     networks:
       - avr
  
@@ -70,7 +72,7 @@ services:
       - 6006:6006
     networks:
       - avr
- 
+
 networks:
   avr:
     name: avr
