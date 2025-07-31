@@ -464,8 +464,8 @@ async def main():
         ws_handler = WebSocketHandler(websocket)
         await ws_handler.handle_connection()
 
-    async with websockets.serve(handler, "172.20.30.47", WEBSOCKET_PORT):
-        printer(f"[INFO] Server started on ws://172.20.30.47:{WEBSOCKET_PORT}", "info")
+    async with websockets.serve(handler, "0.0.0.0", WEBSOCKET_PORT):
+        printer(f"[INFO] Server started on ws://0.0.0.0:{WEBSOCKET_PORT}", "info")
         await asyncio.Future()
 
 
