@@ -23,7 +23,7 @@ const app = express();
 const connectToCustomBot = () => {
   // --- Make sure this is the correct IP address for your Python server.
   // --- If the Python script is running on the SAME machine, use 'ws://localhost:8765'
-  const botUrl = "ws://0.0.0.0:8766";
+  const botUrl = "ws://avr-sts-server:8766";
   console.log(`Connecting to custom audio bot at ${botUrl}`);
   return new WebSocket(botUrl);
 };

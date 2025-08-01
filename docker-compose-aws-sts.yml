@@ -43,7 +43,8 @@ services:
     restart: always
     ports:
       - 5038:5038
-      - 5060:5060
+      - 5060:5060/udp
+      - 5060:5060/tcp
       - 8088:8088
       - 10000-10050:10000-10050/udp
     volumes:
@@ -56,7 +57,7 @@ services:
       - EC2_PUBLIC_IP=${EC2_PUBLIC_IP}
     networks:
       - avr
- 
+
   avr-ami:
     image: agentvoiceresponse/avr-ami
     platform: linux/x86_64
