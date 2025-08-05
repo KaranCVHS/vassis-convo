@@ -12,6 +12,7 @@ dependencies = [
     "pyaudio>=0.2.14",
     "python-dotenv>=1.1.1",
     "silero-vad>=5.1.2",
+    "simple-salesforce>=1.12.6",
     "sounddevice>=0.5.2",
     "torch>=2.7.1",
     "torchaudio>=2.7.1",

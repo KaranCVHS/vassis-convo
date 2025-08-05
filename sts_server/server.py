@@ -18,10 +18,39 @@ load_dotenv()
 from amazon_transcribe.client import TranscribeStreamingClient
 from amazon_transcribe.handlers import TranscriptResultStreamHandler
 
+
+from user_info import UserInfo
+from salesforce_handler import SalesforceHandler
+
+tools = [
+    {
+        "toolSpec": {
+            "name": "verify_and_get_user_data",
+            "description": "Verifies a user's identity using their phone number and a unique secret key. If verification is successful, this tool fetches the user's account and medication information. This tool MUST be called and return a successful verification before answering any questions about a user's personal data.",
+            "inputSchema": {
+                "json": {
+                    "type": "object",
+                    "properties": {
+                        "phone": {
+                            "type": "string",
+                            "description": "The user's 10-digit phone number, e.g., '5551234567'.",
+                        },
+                        "secret_key": {
+                            "type": "string",
+                            "description": "The user's secret key. It is the last three letters of their last name, the first letter of their first name, and their birth date as YYYYMMDD. Example: For John Smith born on Jan 3, 1990, the key is 'ithj19900103'.",
+                        },
+                    },
+                    "required": ["phone", "secret_key"],
+                }
+            },
+        }
+    }
+]
+
 # --- Configuration ---
 MODEL_ID = os.getenv("MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-WEBSOCKET_PORT = 8766
+WEBSOCKET_PORT = 8765
 
 config = {
     "log_level": "debug",
@@ -44,9 +73,16 @@ MAX_CHARS_PER_SSML_CHUNK = (
 )
 SHORT_BREAK_MS = 150  # Break after commas or forced splits
 SENTENCE_BREAK_MS = (
-    500  # Break after sentence-ending punctuation (increased for clarity)
+    300  # Break after sentence-ending punctuation (increased for clarity)
 )
-LIST_ITEM_BREAK_MS = 600  # Break after list items (increased for clarity)
+LIST_ITEM_BREAK_MS = 400  # Break after list items (increased for clarity)
+
+
+def _rollback_unmatched_tool_use(self):
+    if self.messages_history and self.messages_history[-1]["role"] == "assistant":
+        # Does the last assistant message contain any toolUse blocks?
+        if any("toolUse" in c for c in self.messages_history[-1]["content"]):
+            self.messages_history.pop()
 
 
 # --- Centralized State Management ---
@@ -89,8 +125,10 @@ def printer(text, level):
 
 
 class BedrockWrapper:
-    def __init__(self, app_state):
+    def __init__(self, app_state, salesforce_handler, user_session):
         self.app_state = app_state
+        self.sf_handler = salesforce_handler
+        self.user_session = user_session
         self.polly = boto3.client("polly", region_name=config["region"])
         self.bedrock_runtime = boto3.client(
             service_name="bedrock-runtime", region_name=config["region"]
@@ -98,7 +136,293 @@ class BedrockWrapper:
         self.messages_history = []
 
     def _get_system_prompt(self):
-        return "You are a friendly and helpful voice assistant. Keep your responses concise and conversational."
+        # Add comprehensive debugging
+        printer(f"[DEBUG] User verified: {self.user_session.is_verified}", "info")
+        printer(
+            f"[DEBUG] SF data exists: {self.user_session.sf_data is not None}", "info"
+        )
+        printer(f"[DEBUG] SF data: {self.user_session.sf_data}", "info")
+        printer(f"[DEBUG] First name: '{self.user_session.first_name}'", "info")
+        printer(f"[DEBUG] Last name: '{self.user_session.last_name}'", "info")
+
+        # Check current verification status and build dynamic prompt
+        if self.user_session.is_verified and self.user_session.sf_data:
+            printer(
+                "[DEBUG] User is verified - generating VERIFIED system prompt",
+                "info",
+            )
+            # User is verified - include their data in the system prompt
+            verification_status = f"""**CURRENT USER STATUS: VERIFIED**
+    - User: {self.user_session.first_name} {self.user_session.last_name}
+    - You may answer all questions about their healthcare data using the information below.
+    - DO NOT ask for verification again.
+
+    **AVAILABLE USER DATA:**
+    - Benefit Status: {self.user_session.sf_data.get("CoverageBenefit", {}).get("status")}
+    - PA Status: {self.user_session.sf_data.get("CarePreauth", {}).get("outcome")}
+    - PA Identifier: {self.user_session.sf_data.get("CarePreauth", {}).get("identifier")}
+    - Medication Status: {self.user_session.sf_data.get("MedicationRequest", {}).get("status")}
+    - Payment Status: {self.user_session.sf_data.get("Payments", {}).get("status")}
+    - Payment Amount: ${self.user_session.sf_data.get("Payments", {}).get("price")}"""
+
+            verification_instructions = """**IMPORTANT:** This user is already verified. Answer their healthcare questions directly using the data above."""
+        else:
+            printer(
+                "[DEBUG] User is NOT verified - generating NOT VERIFIED system prompt",
+                "info",
+            )
+            # User is not verified
+            verification_status = """**CURRENT USER STATUS: NOT VERIFIED**
+    - You MUST verify the user before answering any personal healthcare questions."""
+
+            verification_instructions = """**VERIFICATION REQUIRED:**
+    1. Ask for their **phone number and secret key together**.
+    2. Use the `verify_and_get_user_data` tool to verify them.
+    3. If verification fails, ask them to re-enter the information.
+    4. Once verified, you can answer their questions."""
+
+        system_prompt = f"""You are a helpful AI assistant for a healthcare provider.
+
+    {verification_status}
+
+    {verification_instructions}
+
+    **USE CASES** (Once Verified)
+
+    1. **Benefit Verification (BV)**
+    - Tell patients whether their insurance covers a medication and what their copay or out-of-pocket cost is.
+    - If "Covered" → Show copay and send secure payment link.
+    - If "Not Covered" → Show full cost and send payment link.
+    - If "Covered with Condition" → 
+        - PA Pending → Notify it's in progress.
+        - PA Approved → Show copay and send link.
+        - PA Rejected → Show full cost and send link.
+    - Fallback: "We are reviewing your benefit details. Please check back soon."
+
+    2. **Prior Authorization (PA)**
+    - Explain the PA process and current status.
+    - If PA is "Initiated" or "Submitted" → Notify user it is pending.
+    - If PA is "Approved" → Show copay and send secure payment link.
+    - If PA is "Rejected" → Show out-of-pocket cost and send link.
+    - If no PA record but medication needs one → Inform the user.
+    - Fallback: "We are reviewing your benefit details. Please check back soon."
+
+    3. **Payment (OOP)**
+    - Clarify what the user owes and whether insurance covers the medication.
+    - If Payment_status is "Unpaid" → Remind user of secure payment link.
+    - Fallback: "We are reviewing your benefit details. Please check back soon."
+
+    4. **Order Status**
+    - Answer questions about shipment, delivery, and payment confirmation.
+    - Based on Order_status:
+        - Placed/Processing → Preparing for shipment.
+        - Shipped → Tracking sent.
+        - Out for delivery → On the way.
+        - Delivered → Include delivery address.
+        - Cancelled → Inform and suggest reordering.
+    - If payment is pending → Inform order not placed yet.
+    - Fallback: "We're reviewing your order details. Please check back soon."
+
+    **REMINDERS**
+    - Always use patient-friendly, clear language.
+    - Never give raw data or medical advice.
+    - Only operate within the verified patient support domain (coverage, PA, payment, order status).
+    """
+
+        # Log the final system prompt for debugging
+        printer(
+            f"[DEBUG] Generated system prompt length: {len(system_prompt)} chars",
+            "info",
+        )
+        printer(f"[DEBUG] System prompt preview: {system_prompt[:200]}...", "info")
+
+        return system_prompt
+
+    def verify_and_get_user_data(self, phone, secret_key):
+        """
+        Verifies a user against Salesforce data using a phone number and a secret key.
+        If successful, it populates the user_session with their data.
+        This function is written defensively to handle cases where related records may not exist.
+        """
+        sf = self.sf_handler.get_session()
+        if not sf:
+            return json.dumps(
+                {
+                    "status": "False",
+                    "verificationStatus": "False",
+                    "error": "Salesforce connection not available.",
+                }
+            )
+
+        try:
+            # 1. Verify Account
+            acct_query = (
+                f"SELECT Id, Name, FirstName, LastName, PersonBirthdate "
+                f"FROM Account WHERE Phone = '{phone}'"
+            )
+            acct_result = sf.query(acct_query)
+
+            if acct_result["totalSize"] == 0:
+                return json.dumps(
+                    {
+                        "status": "False",
+                        "verificationStatus": "False",
+                        "reason": "No account found with that phone number.",
+                    }
+                )
+
+            account = acct_result["records"][0]
+            first_name = account.get("FirstName")
+            last_name = account.get("LastName")
+            birthdate = account.get("PersonBirthdate")
+            print(f"account: {account}")
+
+            if not all([first_name, last_name, birthdate]):
+                return json.dumps(
+                    {
+                        "status": "False",
+                        "verificationStatus": "False",
+                        "reason": "Account data is incomplete for verification.",
+                    }
+                )
+
+            expected_key = (
+                last_name[-3:] + first_name[0] + birthdate.replace("-", "")
+            ).lower()
+            secret_key_clean = secret_key.strip().lower()
+
+            if secret_key_clean != expected_key:
+                return json.dumps(
+                    {
+                        "status": "False",
+                        "verificationStatus": "False",
+                        "reason": "The provided secret key is incorrect.",
+                    }
+                )
+
+            # --- Verification Successful ---
+            self.user_session.is_verified = True
+            self.user_session.first_name = first_name
+            self.user_session.last_name = last_name
+
+            # 2. Defensively Fetch Related Data
+            account_id = account["Id"]
+            print(f"account_id: {account_id}")
+
+            # Initialize all data points with default "Not available" values
+            coverage_outcome = "Not available"
+            pa_identifier = "N/A"
+            pa_outcome = "N/A"
+            med_status = "Not available"
+            payment_price = "N/A"
+            payment_status = "N/A"
+
+            # CareProgramEnrollee
+            cpe_result = sf.query(
+                f"SELECT Id FROM CareProgramEnrollee WHERE AccountId = '{account_id}'"
+            )
+            if cpe_result["totalSize"] > 0:
+                cpe_id = cpe_result["records"][0].get("Id")
+
+                # CoverageBenefit (only if enrollee exists)
+                cb_result = sf.query(
+                    f"SELECT Id, VHS_Outcome__c FROM CoverageBenefit WHERE VHS_Care_Program_Enrollee__c = '{cpe_id}' ORDER BY CreatedDate DESC LIMIT 1"
+                )
+                if cb_result["totalSize"] > 0:
+                    coverage_outcome = cb_result["records"][0].get(
+                        "VHS_Outcome__c", "Not available"
+                    )
+                    cb_id = cb_result["records"][0].get("Id")
+
+                    # CarePreauth (only if coverage benefit exists)
+                    pa_result = sf.query(
+                        f"SELECT PreauthIdentifier, VHS_PAOutcome__c FROM CarePreauth WHERE VHS_Coverage_Benefit__c='{cb_id}' ORDER BY CreatedDate DESC LIMIT 1"
+                    )
+                    if pa_result["totalSize"] > 0:
+                        pa_identifier = pa_result["records"][0].get("PreauthIdentifier")
+                        pa_outcome = pa_result["records"][0].get("VHS_PAOutcome__c")
+
+            # MedicationRequest
+            med_result = sf.query(
+                f"SELECT Id, Status FROM MedicationRequest WHERE PatientId = '{account_id}' ORDER BY CreatedDate DESC LIMIT 1"
+            )
+            if med_result["totalSize"] > 0:
+                med_status = med_result["records"][0].get("Status", "Not available")
+                med_id = med_result["records"][0].get("Id")
+
+                # Payments (only if medication request exists)
+                pay_result = sf.query(
+                    f"SELECT Price__c, Status__c FROM Payments__c WHERE Medication_Request__c = '{med_id}' ORDER BY CreatedDate DESC LIMIT 1"
+                )
+                if pay_result["totalSize"] > 0:
+                    payment_price = pay_result["records"][0].get("Price__c")
+                    payment_status = pay_result["records"][0].get("Status__c")
+
+            # 3. Store all fetched data in the user session object
+            self.user_session.sf_data = {
+                "CoverageBenefit": {"status": coverage_outcome},
+                "CarePreauth": {"identifier": pa_identifier, "outcome": pa_outcome},
+                "MedicationRequest": {"status": med_status},
+                "Payments": {"price": payment_price, "status": payment_status},
+            }
+
+            # 4. Return success to the LLM
+            return json.dumps(
+                {
+                    "status": "True",
+                    "verificationStatus": "True",
+                    "message": f"Successfully verified {first_name}. You can now answer their questions using the data provided.",
+                    "data": self.user_session.sf_data,
+                }
+            )
+
+        except Exception as e:
+            print(f"[ERROR] Tool execution failed: {e}")
+            return json.dumps(
+                {
+                    "status": "False",
+                    "verificationStatus": "False",
+                    "error": "An unexpected error occurred during data retrieval.",
+                }
+            )
+
+    def processToolUse(self, toolName, toolInput):
+        """Process tool use similar to your original processToolUse method"""
+        tool = toolName.lower()
+        printer(f"Tool Use - Name: {toolName}, Input: {toolInput}", "debug")
+
+        try:
+            if tool == "verify_and_get_user_data":
+                printer("****Processing verify_and_get_user_data tool use****", "debug")
+
+                phone = toolInput.get("phone", "")
+                secret_key = toolInput.get("secret_key", "")
+
+                if not phone or not secret_key:
+                    return json.dumps(
+                        {
+                            "status": "False",
+                            "verificationStatus": "False",
+                            "error": "Phone number or secret key is missing. Please provide both.",
+                        }
+                    )
+
+                result = self.verify_and_get_user_data(phone, secret_key)
+                return result
+
+            else:
+                return json.dumps(
+                    {"status": "False", "error": f"Tool {toolName} is not supported"}
+                )
+
+        except Exception as e:
+            printer(f"Error in processToolUse: {str(e)}", "info")
+            return json.dumps(
+                {
+                    "status": "False",
+                    "error": f"An error occurred during tool execution: {str(e)}",
+                }
+            )
 
     async def _stream_bedrock_events(self, stream):
         """Asynchronously yields events from the Bedrock stream without raising StopIteration into a future."""
@@ -193,6 +517,7 @@ class BedrockWrapper:
                 if not data:
                     break
                 await websocket.send(data)
+                await asyncio.sleep(0.256)
         except asyncio.CancelledError:
             printer("[AUDIO] Audio streaming cancelled.", "debug")
         except websockets.exceptions.ConnectionClosed:
@@ -205,6 +530,7 @@ class BedrockWrapper:
                 audio_data_stream.close()
 
     async def _speak_text(self, websocket, ssml_text):
+        """Convert SSML text to speech and send to websocket"""
         cleaned_ssml = re.sub(r"\*[^*]*\*", "", ssml_text)
 
         if not cleaned_ssml.strip() or re.fullmatch(
@@ -229,64 +555,187 @@ class BedrockWrapper:
         except Exception as e:
             printer(f"[ERROR] Polly synthesis failed: {e}", "info")
 
+    def _rollback_messages(self, target_count):
+        """Rollback message history to target count"""
+        self.messages_history = self.messages_history[:target_count]
+        printer(f"[DEBUG] Rolled back messages to count: {target_count}", "debug")
+
+    def _add_user_message(self, text):
+        """Add user message to history"""
+        self.messages_history.append({"role": "user", "content": [{"text": text}]})
+
+    def _add_assistant_message(self, text):
+        """Add assistant message to history"""
+        if text.strip():
+            self.messages_history.append(
+                {"role": "assistant", "content": [{"text": text.strip()}]}
+            )
+
+    async def _handle_tool_requests(self, tool_requests):
+        """Process tool requests and return results for next turn"""
+        tool_results = []
+
+        for tool_request_content in tool_requests:
+            tool_request = tool_request_content["toolUse"]
+            tool_name = tool_request["name"]
+            tool_id = tool_request["toolUseId"]
+            tool_input = tool_request["input"]
+
+            printer(f"[INFO] Tool: {tool_name}, Input: {tool_input}", "info")
+
+            # Handle verification guardrail
+            if (
+                tool_name == "verify_and_get_user_data"
+                and self.user_session.is_verified
+            ):
+                printer(
+                    "[INFO] Guardrail: Blocked redundant verification call.", "info"
+                )
+                result_text = "User is already verified. Please answer the user's question directly using the information provided in the system prompt."
+            else:
+                # Execute the tool using our direct method
+                result_text = self.processToolUse(tool_name, tool_input)
+
+                # Try to format JSON nicely for logging
+                try:
+                    parsed_result = json.loads(result_text)
+                    printer(
+                        f"[INFO] Tool result: {json.dumps(parsed_result, indent=2)}",
+                        "debug",
+                    )
+                except:
+                    printer(f"[INFO] Tool result: {result_text}", "debug")
+
+            tool_results.append(
+                {
+                    "toolResult": {
+                        "toolUseId": tool_id,
+                        "content": [{"text": result_text}],
+                    }
+                }
+            )
+        return tool_results
+
+    async def _process_streaming_response(self, websocket):
+        """Handle streaming response from Bedrock after tool execution"""
+        response_stream = self.bedrock_runtime.converse_stream(
+            modelId=MODEL_ID,
+            messages=self.messages_history,
+            system=[{"text": self._get_system_prompt()}],
+            toolConfig={"tools": tools},
+        )
+
+        bedrock_event_stream = self._stream_bedrock_events(response_stream["stream"])
+        ssml_chunk_gen = self._to_ssml_chunk_generator(bedrock_event_stream)
+
+        full_response = ""
+
+        async for ssml_chunk in ssml_chunk_gen:
+            if self.app_state.was_interrupted():
+                break
+
+            # Extract plain text for logging and history
+            plain_text = re.sub(r"<[^>]+>", "", ssml_chunk).strip()
+            if plain_text:
+                print(f"ASSISTANT: {plain_text}", flush=True)
+                full_response += plain_text + " "
+
+            # Speak the SSML chunk
+            await self._speak_text(websocket, ssml_chunk)
+
+        return full_response.strip()
+
+    async def _handle_simple_response(self, websocket, response_message):
+        """Handle non-tool response from Bedrock"""
+        text_content = ""
+        for content in response_message.get("content", []):
+            if "text" in content:
+                text_content += content["text"]
+
+        if text_content:
+            ssml_response = f"<speak>{text_content}</speak>"
+            await self._speak_text(websocket, ssml_response)
+            print(f"ASSISTANT: {text_content}", flush=True)
+            return text_content
+        else:
+            error_msg = "I'm sorry, I couldn't generate a response. Please try again."
+            await self._speak_text(websocket, f"<speak>{error_msg}</speak>")
+            return ""
+
     async def invoke_bedrock(self, websocket, text):
+        """Main method to invoke Bedrock - simplified and easy to follow"""
         printer(f"\n[BEDROCK] Invoking with: '{text}'", "info")
+        printer("[BEDROCK] Starting bot speech...", "debug")
+        print("User info:", self.user_session.__dict__)
+
+        # Start bot speech state
         self.app_state.start_bot_speech()
-        full_assistant_response_raw = ""
+
+        # Save initial state for potential rollback
+        initial_message_count = len(self.messages_history)
+
         try:
-            self.messages_history.append({"role": "user", "content": [{"text": text}]})
-            response_stream = self.bedrock_runtime.converse_stream(
+            # 1. Add user message to history
+            self._add_user_message(text)
+
+            # 2. Get initial response from Bedrock
+            response = self.bedrock_runtime.converse(
                 modelId=MODEL_ID,
                 messages=self.messages_history,
                 system=[{"text": self._get_system_prompt()}],
+                toolConfig={"tools": tools},
             )
 
-            bedrock_event_stream = self._stream_bedrock_events(
-                response_stream["stream"]
-            )
-            ssml_chunk_gen = self._to_ssml_chunk_generator(bedrock_event_stream)
+            response_message = response["output"]["message"]
+            self.messages_history.append(response_message)
 
-            async for ssml_chunk in ssml_chunk_gen:
-                if self.app_state.was_interrupted():
-                    break
+            # 3. Handle response based on type
+            if response.get("stopReason") == "tool_use":
+                # Extract and process tool requests
+                tool_requests = [
+                    c for c in response_message["content"] if "toolUse" in c
+                ]
 
-                plain_text = re.sub(r"<[^>]+>", "", ssml_chunk).strip()
-                if plain_text:
-                    print(f"ASSISTANT: {plain_text}", flush=True)
-                    full_assistant_response_raw += plain_text + " "
+                if tool_requests:
+                    # Execute tools and get results
+                    tool_results = await self._handle_tool_requests(tool_requests)
 
-                await self._speak_text(websocket, ssml_chunk)
+                    # Add tool results to message history
+                    self.messages_history.append(
+                        {"role": "user", "content": tool_results}
+                    )
 
-            if full_assistant_response_raw and not self.app_state.was_interrupted():
-                self.messages_history.append(
-                    {
-                        "role": "assistant",
-                        "content": [{"text": full_assistant_response_raw.strip()}],
-                    }
-                )
+                    # Get streaming response after tool execution
+                    final_response = await self._process_streaming_response(websocket)
+
+                    # Save the final response to history if successful
+                    if final_response and not self.app_state.was_interrupted():
+                        self._add_assistant_message(final_response)
+                    else:
+                        # Rollback on interruption or empty response
+                        self._rollback_messages(initial_message_count)
+                else:
+                    # No tool results, rollback
+                    self._rollback_messages(initial_message_count)
             else:
-                if (
-                    self.messages_history
-                    and self.messages_history[-1]["role"] == "user"
-                ):
-                    self.messages_history.pop()
+                # Handle simple text response
+                final_response = await self._handle_simple_response(
+                    websocket, response_message
+                )
+
+                if not final_response:
+                    # Rollback if no valid response
+                    self._rollback_messages(initial_message_count)
 
         except asyncio.CancelledError:
             printer("[BEDROCK] Bedrock task was cancelled by external signal.", "debug")
-            if self.messages_history and self.messages_history[-1]["role"] == "user":
-                self.messages_history.pop()
         except Exception as e:
             printer(f"[ERROR] Bedrock invocation error: {e}", "info")
-            if (
-                not self.app_state.was_interrupted()
-                and self.messages_history
-                and self.messages_history[-1]["role"] == "user"
-            ):
-                await self._speak_text(
-                    websocket,
-                    "<speak>I'm sorry, I encountered an error. Please try again.</speak>",
-                )
-                self.messages_history.pop()
+
+            # Send error message if not interrupted
+            if not self.app_state.was_interrupted():
+                error_msg = "I'm sorry, I encountered an error. Please try again."
+                await self._speak_text(websocket, f"<speak>{error_msg}</speak>")
         finally:
             print("", end="\n", flush=True)
             self.app_state.stop_bot_speech()
@@ -313,9 +762,21 @@ class TranscriptHandler(TranscriptResultStreamHandler):
 
 class WebSocketHandler:
     def __init__(self, websocket):
+        try:
+            self.sf_handler = SalesforceHandler()
+        except Exception:
+            printer(
+                "[FATAL] Could not connect to Salesforce. Please check credentials.",
+                "info",
+            )
         self.websocket = websocket
+        self.user_session = UserInfo()
         self.app_state = AppState()
-        self.bedrock_wrapper = BedrockWrapper(self.app_state)
+        self.bedrock_wrapper = BedrockWrapper(
+            self.app_state,
+            salesforce_handler=self.sf_handler,
+            user_session=self.user_session,
+        )
         self.transcribe_client = TranscribeStreamingClient(region=config["region"])
         self.samplerate = int(config["polly"]["SampleRate"])
         self.VAD_CHUNK_SIZE_BYTES = 512
@@ -357,7 +818,9 @@ class WebSocketHandler:
             )
 
     async def handle_connection(self):
-        self._handle_transcription("User said hello.")
+        self._handle_transcription(
+            "Hey there my phone number is 9388609635 and my secret key is nnyj20000318 help me verify"
+        )
 
         is_transcribing = False
         transcribe_stream, transcript_handler, transcript_task = None, None, None
@@ -464,8 +927,8 @@ async def main():
         ws_handler = WebSocketHandler(websocket)
         await ws_handler.handle_connection()
 
-    async with websockets.serve(handler, "172.20.30.47", WEBSOCKET_PORT):
-        printer(f"[INFO] Server started on ws://172.20.30.47:{WEBSOCKET_PORT}", "info")
+    async with websockets.serve(handler, "0.0.0.0", WEBSOCKET_PORT):
+        printer(f"[INFO] Server started on ws://0.0.0.0:{WEBSOCKET_PORT}", "info")
         await asyncio.Future()
 
 

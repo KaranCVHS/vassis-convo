@@ -18,7 +18,7 @@ RUN apt-get update && apt-get install -y \
 # Copy project files
 COPY requirements.txt pyproject.toml ./
 COPY main.py server.py ./
-COPY .env .python-version ./
+COPY .env ./
 
 # Install Python dependencies
 RUN pip install --upgrade pip && \
