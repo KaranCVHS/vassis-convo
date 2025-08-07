@@ -22,6 +22,14 @@ from amazon_transcribe.handlers import TranscriptResultStreamHandler
 from user_info import UserInfo
 from salesforce_handler import SalesforceHandler
 
+
+# --- Configuration ---
+MODEL_ID = os.getenv("MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0")
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+WEBSOCKET_PORT = 8765
+LINK = os.getenv("ENROLLMENT_LINK", "https://example.com/enroll")
+
+
 tools = [
     {
         "toolSpec": {
@@ -44,13 +52,30 @@ tools = [
                 }
             },
         }
-    }
+    },
+    {
+        "toolSpec": {
+            "name": "send_user_enrollment_link",
+            "description": "Sends an enrollment link to the user via SMS. This tool is used when a user is not enrolled in the AccessFirst DTP Program he can either request enrollment or if during verification the user is not enrolled, this tool will be called to send them an enrollment link. This tool must ask the user for their phone number and country code.",
+            "inputSchema": {
+                "json": {
+                    "type": "object",
+                    "properties": {
+                        "phone": {
+                            "type": "string",
+                            "description": "The user's 10-digit phone number, e.g., '5551234567'.",
+                        },
+                        "country_code": {
+                            "type": "string",
+                            "description": "The country code for the phone number, e.g., '1' for US numbers and '91' for India.",
+                        },
+                    },
+                    "required": ["phone", "country_code"],
+                }
+            },
+        }
+    },
 ]
-
-# --- Configuration ---
-MODEL_ID = os.getenv("MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0")
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-WEBSOCKET_PORT = 8765
 
 config = {
     "log_level": "debug",
@@ -58,7 +83,7 @@ config = {
     "polly": {
         "Engine": "neural",
         "LanguageCode": "en-US",
-        "VoiceId": "Joanna",
+        "VoiceId": "Matthew",
         "OutputFormat": "pcm",
         "SampleRate": "8000",
         "TextType": "ssml",
@@ -158,14 +183,15 @@ class BedrockWrapper:
     - DO NOT ask for verification again.
 
     **AVAILABLE USER DATA:**
-    - Benefit Status: {self.user_session.sf_data.get("CoverageBenefit", {}).get("status")}
-    - PA Status: {self.user_session.sf_data.get("CarePreauth", {}).get("outcome")}
+    - Coverage Status (CB_status): {self.user_session.sf_data.get("CoverageBenefit", {}).get("status")}
+    - PA Outcome (PA_outcome): {self.user_session.sf_data.get("CarePreauth", {}).get("outcome")}
     - PA Identifier: {self.user_session.sf_data.get("CarePreauth", {}).get("identifier")}
     - Medication Status: {self.user_session.sf_data.get("MedicationRequest", {}).get("status")}
     - Payment Status: {self.user_session.sf_data.get("Payments", {}).get("status")}
-    - Payment Amount: ${self.user_session.sf_data.get("Payments", {}).get("price")}"""
+    - Payment Amount: ${self.user_session.sf_data.get("Payments", {}).get("price")}
+    - Order Status: {self.user_session.sf_data.get("Order", {}).get("status")}"""
 
-            verification_instructions = """**IMPORTANT:** This user is already verified. Answer their healthcare questions directly using the data above."""
+            verification_instructions = """**IMPORTANT:** This user is already verified. Answer their healthcare questions directly using the data above and the response logic below."""
         else:
             printer(
                 "[DEBUG] User is NOT verified - generating NOT VERIFIED system prompt",
@@ -179,62 +205,109 @@ class BedrockWrapper:
     1. Ask for their **phone number and secret key together**.
     2. Use the `verify_and_get_user_data` tool to verify them.
     3. If verification fails, ask them to re-enter the information.
-    4. Once verified, you can answer their questions."""
+    4. Once verified, you can answer their questions using the response logic below."""
 
-        system_prompt = f"""You are a helpful AI assistant for a healthcare provider.
+        system_prompt = f"""You are V-Assist, an AI helper for patients in a AccessFirst DTP Program. Your role is to assist users with enrollment, orders, tracking, refills, and payments. Be helpful, friendly, and empathetic in all interactions.
 
-    {verification_status}
+        **GENERAL INFORMATION**
+        - Prior Authorization (PA) takes 2 to 3 business days after the request is submitted.
 
-    {verification_instructions}
+        {verification_status}
 
-    **USE CASES** (Once Verified)
+        {verification_instructions}
 
-    1. **Benefit Verification (BV)**
-    - Tell patients whether their insurance covers a medication and what their copay or out-of-pocket cost is.
-    - If "Covered" → Show copay and send secure payment link.
-    - If "Not Covered" → Show full cost and send payment link.
-    - If "Covered with Condition" → 
-        - PA Pending → Notify it's in progress.
-        - PA Approved → Show copay and send link.
-        - PA Rejected → Show full cost and send link.
-    - Fallback: "We are reviewing your benefit details. Please check back soon."
+        **RESPONSE LOGIC FOR VERIFIED USERS:**
 
-    2. **Prior Authorization (PA)**
-    - Explain the PA process and current status.
-    - If PA is "Initiated" or "Submitted" → Notify user it is pending.
-    - If PA is "Approved" → Show copay and send secure payment link.
-    - If PA is "Rejected" → Show out-of-pocket cost and send link.
-    - If no PA record but medication needs one → Inform the user.
-    - Fallback: "We are reviewing your benefit details. Please check back soon."
+        **BENEFIT VERIFICATION & COVERAGE QUESTIONS:**
+        Use CB_status, PA_outcome, Payment_status, and Price to determine response:
 
-    3. **Payment (OOP)**
-    - Clarify what the user owes and whether insurance covers the medication.
-    - If Payment_status is "Unpaid" → Remind user of secure payment link.
-    - Fallback: "We are reviewing your benefit details. Please check back soon."
+        1. If CB_status is "Covered" and Payment_status is "Unpaid":
+        "Your benefit verification is complete. Your insurance has approved the coverage. Your copay is $<price>. A secure payment link has been sent to your phone."
 
-    4. **Order Status**
-    - Answer questions about shipment, delivery, and payment confirmation.
-    - Based on Order_status:
-        - Placed/Processing → Preparing for shipment.
-        - Shipped → Tracking sent.
-        - Out for delivery → On the way.
-        - Delivered → Include delivery address.
-        - Cancelled → Inform and suggest reordering.
-    - If payment is pending → Inform order not placed yet.
-    - Fallback: "We're reviewing your order details. Please check back soon."
+        2. If CB_status is "Not Covered" and Payment_status is "Unpaid":
+        "Your benefit verification was completed, but your insurance does not cover this medication. Your out-of-pocket expense is $<price>. A secure payment link has been sent to your phone."
 
-    **REMINDERS**
-    - Always use patient-friendly, clear language.
-    - Never give raw data or medical advice.
-    - Only operate within the verified patient support domain (coverage, PA, payment, order status).
-    """
+        3. If CB_status is "Covered with Condition" and PA_outcome is "Initiated" or "Submitted":
+        "Your insurance covers the medication with conditions. Prior authorization has been initiated. We'll notify you with updates."
 
-        # Log the final system prompt for debugging
-        printer(
-            f"[DEBUG] Generated system prompt length: {len(system_prompt)} chars",
-            "info",
-        )
-        printer(f"[DEBUG] System prompt preview: {system_prompt[:200]}...", "info")
+        4. If CB_status is "Covered with Condition", PA_outcome is "Approved", and Payment_status is "Unpaid":
+        "Coverage approved after prior authorization. Your copay is $<price>. A secure payment link has been sent to your phone."
+
+        5. If CB_status is "Covered with Condition", PA_outcome is "Rejected", and Payment_status is "Unpaid":
+        "Coverage denied after prior authorization. Your out-of-pocket expense is $<price>. A secure payment link has been sent to your phone."
+
+        **PRIOR AUTHORIZATION QUESTIONS:**
+        For PA status inquiries, use these response variations:
+
+        - If PA_outcome is "Initiated" or "Submitted":
+        Choose from: "Your prior authorization is still pending with your insurance. These typically take 1-2 business days." OR "Your prior authorization has been initiated; we'll notify you as soon as we have an update."
+
+        - If PA_outcome is "Approved":
+        "Your PA has been approved; your copay is $<price>. A secure payment link has been sent."
+
+        - If PA_outcome is "Rejected":
+        "Unfortunately, your prior authorization has been rejected. Your out-of-pocket expense is $<price>. A secure payment link has been sent."
+
+        - If no PA record exists (CB_status is "Covered" or "Not Covered"):
+        "You don't have a prior authorization associated with your account."
+
+        **ORDER STATUS & SHIPMENT QUESTIONS:**
+
+        For "When will I get my order?":
+        "We expect your order to arrive within 3–5 business days."
+
+        For "Was my payment received?" and Payment_status is "Paid":
+        "Yes, we've received your payment of $<price>. Your order has been confirmed."
+
+        For order status questions ("Did you place the order?", "Has it shipped?", "What's the status?"):
+        - If Payment_status is "Unpaid": "Your order has not yet been placed because we have not received your payment of $<price>. Please check the payment link sent to your phone."
+        - If Payment_status is "Paid" and Order_status is "Order Placed": "Your order has been placed and is being prepared for shipment."
+        - If Payment_status is "Paid" and Order_status is "Order Processing": "Your order has been placed and is being prepared for shipment."
+        - If Payment_status is "Paid" and Order_status is "Order Shipped": "We have processed and shipped your order. The tracking number has been sent to your phone."
+        - If Payment_status is "Paid" and Order_status is "Out for delivery": "Your order is out for delivery. You should be receiving your order soon. The tracking number has been sent to your phone."
+        - If Payment_status is "Paid" and Order_status is "Delivered": "Your order has been delivered at your address, <delivery_address>."
+        - If Payment_status is "Paid" and Order_status is "Order Cancelled": "Your order has been cancelled. Please check the link sent to your phone if you want to place a new order."
+
+        **COMMUNICATION GUIDELINES:**
+        - Use simple, everyday language that anyone can understand
+        - Avoid medical jargon, technical terms, or complex explanations
+        - Speak in a friendly, conversational tone
+        - Keep responses clear and to the point
+        - Don't give bullet points or lists, just simple sentences
+        - Always replace <price> with the actual payment amount
+
+        **ENROLLMENT PROCESS:**
+        - When user requests enrollment or you find that the phone number is not found in the database, ask for their phone number and country code to send enrollment link to the users phone number. If not enrolled, explain they must enroll to access services. Offer to send enrollment instructions via SMS to the provided phone number.
+        - DO NOT CREATE YOUR OWN PHONE NUMBER OR COUNTRY CODE. Always ask the user for their phone number and country code.
+
+        **VERIFICATION PROCESS:**
+        If user is already enrolled, request their secret key to verify identity. Secret key format: three letters of last name, first letter of first name, followed by date of birth in YYYY-MM-DD format. Once correctly formatted secret key is provided, consider them verified.
+
+        **HANDLING CORRECTIONS:**
+        If user corrects previously given information, apologize for confusion, discard old information completely, and use only the new information going forward.
+
+        **FAILED VALIDATIONS:**
+        When validation fails, always repeat back exactly what the user provided to confirm accuracy: "I received the phone number [user's input] and secret key [user's input], but there seems to be an issue with [specific problem]. Could you please verify these details?"
+
+        **TOOL CALL NOTIFICATIONS:**
+        When making tool calls after user provides details, notify the user: "Please stay on the line while I fetch your details" (use variations to keep it fresh).
+
+        **MEDICAL ADVICE BOUNDARY:**
+        If asked for medical guidance, reply: "I'm not able to give medical advice. Please contact your healthcare provider."
+
+        **FALLBACK RESPONSES:**
+        If no conditions match or information is unclear:
+        "We are reviewing your benefit details. Please check back soon."
+
+        **WHAT NOT TO DO:**
+        - Do not refuse to share program or order information once user is verified
+        - Do not mention privacy, security, or data-storage policies after verification
+        - Do not provide medical advice, health recommendations, or treatment suggestions
+        - Do not suggest changes to medications or dosages
+        - Do not raise additional eligibility, privacy, or security concerns after verification
+
+        **TONE:** Always maintain a professional yet friendly tone. Be clear, concise, and reassuring. Prioritize helping the user get what they need as quickly as possible. Keep answers short unless asked for detailed information.
+        """
 
         return system_prompt
 
@@ -255,7 +328,6 @@ class BedrockWrapper:
             )
 
         try:
-            # 1. Verify Account
             acct_query = (
                 f"SELECT Id, Name, FirstName, LastName, PersonBirthdate "
                 f"FROM Account WHERE Phone = '{phone}'"
@@ -289,7 +361,7 @@ class BedrockWrapper:
             expected_key = (
                 last_name[-3:] + first_name[0] + birthdate.replace("-", "")
             ).lower()
-            secret_key_clean = secret_key.strip().lower()
+            secret_key_clean = secret_key.strip().lower().replace(" ", "")
 
             if secret_key_clean != expected_key:
                 return json.dumps(
@@ -300,16 +372,13 @@ class BedrockWrapper:
                     }
                 )
 
-            # --- Verification Successful ---
             self.user_session.is_verified = True
             self.user_session.first_name = first_name
             self.user_session.last_name = last_name
 
-            # 2. Defensively Fetch Related Data
             account_id = account["Id"]
             print(f"account_id: {account_id}")
 
-            # Initialize all data points with default "Not available" values
             coverage_outcome = "Not available"
             pa_identifier = "N/A"
             pa_outcome = "N/A"
@@ -317,14 +386,12 @@ class BedrockWrapper:
             payment_price = "N/A"
             payment_status = "N/A"
 
-            # CareProgramEnrollee
             cpe_result = sf.query(
                 f"SELECT Id FROM CareProgramEnrollee WHERE AccountId = '{account_id}'"
             )
             if cpe_result["totalSize"] > 0:
                 cpe_id = cpe_result["records"][0].get("Id")
 
-                # CoverageBenefit (only if enrollee exists)
                 cb_result = sf.query(
                     f"SELECT Id, VHS_Outcome__c FROM CoverageBenefit WHERE VHS_Care_Program_Enrollee__c = '{cpe_id}' ORDER BY CreatedDate DESC LIMIT 1"
                 )
@@ -334,7 +401,6 @@ class BedrockWrapper:
                     )
                     cb_id = cb_result["records"][0].get("Id")
 
-                    # CarePreauth (only if coverage benefit exists)
                     pa_result = sf.query(
                         f"SELECT PreauthIdentifier, VHS_PAOutcome__c FROM CarePreauth WHERE VHS_Coverage_Benefit__c='{cb_id}' ORDER BY CreatedDate DESC LIMIT 1"
                     )
@@ -342,7 +408,6 @@ class BedrockWrapper:
                         pa_identifier = pa_result["records"][0].get("PreauthIdentifier")
                         pa_outcome = pa_result["records"][0].get("VHS_PAOutcome__c")
 
-            # MedicationRequest
             med_result = sf.query(
                 f"SELECT Id, Status FROM MedicationRequest WHERE PatientId = '{account_id}' ORDER BY CreatedDate DESC LIMIT 1"
             )
@@ -350,7 +415,6 @@ class BedrockWrapper:
                 med_status = med_result["records"][0].get("Status", "Not available")
                 med_id = med_result["records"][0].get("Id")
 
-                # Payments (only if medication request exists)
                 pay_result = sf.query(
                     f"SELECT Price__c, Status__c FROM Payments__c WHERE Medication_Request__c = '{med_id}' ORDER BY CreatedDate DESC LIMIT 1"
                 )
@@ -358,7 +422,6 @@ class BedrockWrapper:
                     payment_price = pay_result["records"][0].get("Price__c")
                     payment_status = pay_result["records"][0].get("Status__c")
 
-            # 3. Store all fetched data in the user session object
             self.user_session.sf_data = {
                 "CoverageBenefit": {"status": coverage_outcome},
                 "CarePreauth": {"identifier": pa_identifier, "outcome": pa_outcome},
@@ -366,7 +429,6 @@ class BedrockWrapper:
                 "Payments": {"price": payment_price, "status": payment_status},
             }
 
-            # 4. Return success to the LLM
             return json.dumps(
                 {
                     "status": "True",
@@ -383,6 +445,53 @@ class BedrockWrapper:
                     "status": "False",
                     "verificationStatus": "False",
                     "error": "An unexpected error occurred during data retrieval.",
+                }
+            )
+
+    def send_user_enrollment_link(self, phone, country_code):
+        sns = boto3.client("sns", region_name="us-east-1")
+        """Sends an enrollment link to the user via SMS."""
+        if not phone or not country_code:
+            return json.dumps(
+                {
+                    "status": "False",
+                    "error": "Phone number or country code is missing. Please provide both.",
+                }
+            )
+        try:
+            # Format the phone number with country code
+            full_phone = f"+{country_code}{phone}"
+            message = (
+                f"Hello! To enroll in the AccessFirst DTP Program, please visit: {LINK}"
+            )
+
+            # Send SMS using SNS
+            response = sns.publish(
+                PhoneNumber=full_phone,
+                Message=message,
+                MessageAttributes={
+                    "AWS.SNS.SMS.SMSType": {
+                        "DataType": "String",
+                        "StringValue": "Transactional",
+                    }
+                },
+            )
+
+            printer(f"[SMS] Enrollment link sent to {full_phone}", "info")
+            printer(f"[SMS] Message SID: {response['MessageId']}", "info")
+
+            return json.dumps(
+                {
+                    "status": "True",
+                    "message": "Enrollment link sent successfully.",
+                }
+            )
+        except Exception as e:
+            printer(f"[ERROR] Failed to send enrollment link: {e}", "info")
+            return json.dumps(
+                {
+                    "status": "False",
+                    "error": f"Failed to send enrollment link: {str(e)}",
                 }
             )
 
@@ -406,8 +515,25 @@ class BedrockWrapper:
                             "error": "Phone number or secret key is missing. Please provide both.",
                         }
                     )
-
                 result = self.verify_and_get_user_data(phone, secret_key)
+                return result
+
+            elif tool == "send_user_enrollment_link":
+                printer(
+                    "****Processing send_user_enrollment_link tool use****", "debug"
+                )
+
+                phone = toolInput.get("phone", "")
+                country_code = toolInput.get("country_code", "")
+
+                if not phone or not country_code:
+                    return json.dumps(
+                        {
+                            "status": "False",
+                            "error": "Phone number or country code is missing. Please provide both.",
+                        }
+                    )
+                result = self.send_user_enrollment_link(phone, country_code)
                 return result
 
             else:
@@ -455,8 +581,6 @@ class BedrockWrapper:
                 text = event["contentBlockDelta"]["delta"]["text"]
                 buffer += text
 
-                # Regex to find sentence ends (., ?, ! followed by space), commas, or newlines
-                # The parentheses around the delimiters make them part of the split result
                 split_pattern = re.compile(r"([.?!]\s*|\s*,\s*|\n)")
 
                 parts = split_pattern.split(buffer)
@@ -663,16 +787,27 @@ class BedrockWrapper:
             return ""
 
     async def invoke_bedrock(self, websocket, text):
-        """Main method to invoke Bedrock - simplified and easy to follow"""
+        """Main method to invoke Bedrock - simplified without rollback functionality"""
         printer(f"\n[BEDROCK] Invoking with: '{text}'", "info")
         printer("[BEDROCK] Starting bot speech...", "debug")
         print("User info:", self.user_session.__dict__)
+        printer(
+            "[BEDROCK] Messages history length: {}".format(len(self.messages_history)),
+            "debug",
+        )
+        printer(
+            "***************************************************************", "debug"
+        )
+        printer(
+            "[BEDROCK] Initial messages history: {}".format(self.messages_history),
+            "debug",
+        )
+        printer(
+            "***************************************************************", "debug"
+        )
 
         # Start bot speech state
         self.app_state.start_bot_speech()
-
-        # Save initial state for potential rollback
-        initial_message_count = len(self.messages_history)
 
         try:
             # 1. Add user message to history
@@ -705,27 +840,26 @@ class BedrockWrapper:
                         {"role": "user", "content": tool_results}
                     )
 
+                    # Check if interrupted before continuing
+                    if self.app_state.was_interrupted():
+                        printer(
+                            "[BEDROCK] Interrupted after tool execution, stopping.",
+                            "debug",
+                        )
+                        return
+
                     # Get streaming response after tool execution
                     final_response = await self._process_streaming_response(websocket)
 
-                    # Save the final response to history if successful
-                    if final_response and not self.app_state.was_interrupted():
+                    # Save the final response to history if we got a response
+                    if final_response:
                         self._add_assistant_message(final_response)
-                    else:
-                        # Rollback on interruption or empty response
-                        self._rollback_messages(initial_message_count)
-                else:
-                    # No tool results, rollback
-                    self._rollback_messages(initial_message_count)
+
             else:
                 # Handle simple text response
                 final_response = await self._handle_simple_response(
                     websocket, response_message
                 )
-
-                if not final_response:
-                    # Rollback if no valid response
-                    self._rollback_messages(initial_message_count)
 
         except asyncio.CancelledError:
             printer("[BEDROCK] Bedrock task was cancelled by external signal.", "debug")
@@ -818,9 +952,7 @@ class WebSocketHandler:
             )
 
     async def handle_connection(self):
-        self._handle_transcription(
-            "Hey there my phone number is 9388609635 and my secret key is nnyj20000318 help me verify"
-        )
+        self._handle_transcription("Hey hello there")
 
         is_transcribing = False
         transcribe_stream, transcript_handler, transcript_task = None, None, None

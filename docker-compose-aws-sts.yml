@@ -36,7 +36,7 @@ services:
       - 8766:8766
     networks:
       - avr
- 
+
   avr-asterisk:
     image: agentvoiceresponse/avr-asterisk
     container_name: avr-asterisk
